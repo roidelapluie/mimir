@@ -38,6 +38,9 @@ type TOCCompat struct {
 
 	Symbols uint64
 
+	// SymbolsEnd bounds the V4 symbol payload and its embedded directory.
+	SymbolsEnd uint64
+
 	// PostingsListEnd is not a standard part of a block index TOC,
 	// but is required by pkg/storage/indexheader/index.PostingOffsetTable
 	// to mark the end of the last postings list entry in the index.
@@ -93,10 +96,15 @@ func TOCFromBucketTSDBIndex(
 	}
 
 	postingsListEnd := tsdbTOC.LabelIndicesTable
+	var symbolsEnd uint64
+	if indexVersion == index.FormatV4 {
+		symbolsEnd = tsdbTOC.Series
+	}
 
 	return &TOCCompat{
 		IndexVersion:        indexVersion,
 		Symbols:             tsdbTOC.Symbols,
+		SymbolsEnd:          symbolsEnd,
 		PostingsListEnd:     postingsListEnd,
 		PostingsOffsetTable: tsdbTOC.PostingsTable,
 		PostingsTableOrigin: tsdbTOC.PostingsTable,
@@ -168,6 +176,14 @@ func TOCFromIndexHeader(
 			return nil, indexHeaderVersion, fmt.Errorf("index-header format version %d has offset %d for postings offsets table", indexHeaderVersion, postingsOffsetTable)
 		}
 
+		var symbolsEnd uint64
+		if indexVersion == index.FormatV4 {
+			symbolsEnd = uint64(indexHeaderTOCOffset)
+			if indexHeaderVersion == BinaryFormatV1 {
+				symbolsEnd = postingsOffsetTable
+			}
+		}
+
 		var postingsTableOrigin, postingsStart uint64
 		if indexVersion == index.FormatV4 && postingsOffsetTable != 0 {
 			decbuf.ResetAt(int(postingsOffsetTable))
@@ -181,6 +197,7 @@ func TOCFromIndexHeader(
 		return &TOCCompat{
 			IndexVersion:        indexVersion,
 			Symbols:             symbols,
+			SymbolsEnd:          symbolsEnd,
 			PostingsListEnd:     postingsListEnd,
 			PostingsOffsetTable: postingsOffsetTable,
 			PostingsTableOrigin: postingsTableOrigin,
@@ -272,10 +289,15 @@ func tocFromDiskTSDBIndex(blockID ulid.ULID, dir string) (toc *TOCCompat, err er
 	}
 
 	postingsListEnd := tsdbTOC.LabelIndicesTable
+	var symbolsEnd uint64
+	if indexVersion == index.FormatV4 {
+		symbolsEnd = tsdbTOC.Series
+	}
 
 	return &TOCCompat{
 		IndexVersion: indexVersion,
 		Symbols:      tsdbTOC.Symbols,
+		SymbolsEnd:   symbolsEnd,
 
 		PostingsListEnd:     postingsListEnd,
 		PostingsOffsetTable: tsdbTOC.PostingsTable,

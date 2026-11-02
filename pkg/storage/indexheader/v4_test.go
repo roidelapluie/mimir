@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
 
+	streamencoding "github.com/grafana/mimir/pkg/storage/indexheader/encoding"
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
 )
 
@@ -51,14 +52,18 @@ func TestV4IndexHeaders(t *testing.T) {
 	bkt := objstore.NewInMemBucket()
 	require.NoError(t, bkt.Upload(ctx, id.String()+"/index", bytes.NewReader(raw)))
 	require.NoError(t, BuildAndWriteSparseHeaderFromTSDBIndex(ctx, id, source, 32, log.NewNopLogger()))
-	sparse, err := os.ReadFile(filepath.Join(dir, block.SparseIndexHeaderFilename))
-	require.NoError(t, err)
-	for _, prebuilt := range []bool{false, true} {
-		if prebuilt {
+	require.NoFileExists(t, filepath.Join(dir, block.SparseIndexHeaderFilename))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, block.SparseIndexHeaderFilename), []byte("obsolete"), 0600))
+	require.NoError(t, BuildAndWriteSparseHeaderFromTSDBIndex(ctx, id, source, 32, log.NewNopLogger()))
+	require.NoFileExists(t, filepath.Join(dir, block.SparseIndexHeaderFilename))
+	// An old or corrupt sidecar must not override the embedded V4 directory.
+	sparse := []byte("obsolete sparse sidecar")
+	for _, staleSidecar := range []bool{false, true} {
+		if staleSidecar {
 			require.NoError(t, bkt.Upload(ctx, id.String()+"/"+block.SparseIndexHeaderFilename, bytes.NewReader(sparse)))
 		}
 		for _, version := range []int{BinaryFormatV1, BinaryFormatV2} {
-			t.Run(fmt.Sprintf("header-%d/prebuilt-%v", version, prebuilt), func(t *testing.T) {
+			t.Run(fmt.Sprintf("header-%d/staleSidecar-%v", version, staleSidecar), func(t *testing.T) {
 				local := t.TempDir()
 				for pass := 0; pass < 2; pass++ {
 					r, err := NewStreamBinaryReader(ctx, id, objstore.WithNoopInstr(bkt), local, Config{Version: version, VerifyOnLoad: true}, 32, log.NewNopLogger(), NewStreamBinaryReaderMetrics(nil))
@@ -98,6 +103,7 @@ func TestV4IndexHeaders(t *testing.T) {
 					require.Equal(t, "value-0250", filtered[0].LabelValue)
 					require.NoError(t, r.Close())
 				}
+				require.NoFileExists(t, filepath.Join(local, id.String(), block.SparseIndexHeaderFilename))
 				// Switching header formats reuses the existing V1 symbols section.
 				if version == BinaryFormatV1 {
 					migrated, err := NewStreamBinaryReader(ctx, id, objstore.WithNoopInstr(bkt), local, Config{Version: BinaryFormatV2, VerifyOnLoad: true}, 32, log.NewNopLogger(), NewStreamBinaryReaderMetrics(nil))
@@ -128,11 +134,13 @@ func TestV4IndexHeaderRejectsCorruption(t *testing.T) {
 	toc, err := index.NewTOCFromByteSlice(realByteSlice(raw))
 	require.NoError(t, err)
 	directory := binary.BigEndian.Uint64(raw[toc.PostingsTable+8:])
+	symbolDirectory := toc.Symbols + 8 + binary.BigEndian.Uint64(raw[toc.Symbols:]) + 4
 	tests := []struct {
 		name      string
 		mutate    func([]byte)
 		openError bool
 	}{
+		{"symbol-directory-checksum", func(b []byte) { b[symbolDirectory+4] ^= 1 }, true},
 		{"header-checksum", func(b []byte) { b[toc.PostingsTable+24] ^= 1 }, true},
 		{"directory-checksum", func(b []byte) { b[directory] ^= 1 }, true},
 		{"directory-bounds", func(b []byte) {
@@ -152,6 +160,8 @@ func TestV4IndexHeaderRejectsCorruption(t *testing.T) {
 				r, err := NewStreamBinaryReader(ctx, id, objstore.WithNoopInstr(bkt), t.TempDir(), Config{Version: version}, 32, log.NewNopLogger(), NewStreamBinaryReaderMetrics(nil))
 				if tt.openError {
 					switch tt.name {
+					case "symbol-directory-checksum":
+						require.ErrorIs(t, err, streamencoding.ErrInvalidChecksum)
 					case "header-checksum":
 						require.ErrorContains(t, err, "invalid paged postings header")
 					case "directory-checksum":

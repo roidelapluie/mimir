@@ -705,7 +705,7 @@ func (b *TSDBBuilder) buildSparseIndexHeader(ctx context.Context, dbDir string, 
 		return fmt.Errorf("failed to build and write to disk in protobuf format: %w", err)
 	}
 
-	level.Info(ll).Log("msg", "built and wrote sparse index-header to disk in protobuf format",
+	level.Info(ll).Log("msg", "prepared index metadata for upload",
 		"elapsed", time.Since(start),
 	)
 	return nil

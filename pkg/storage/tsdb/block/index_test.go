@@ -254,5 +254,6 @@ func TestGatherBlockHealthStats_IndexV4(t *testing.T) {
 	require.NoError(t, stats.AnyErr())
 	require.Equal(t, index.FormatV4, stats.IndexFormat)
 	require.Equal(t, int64(1), stats.TotalSeries)
-	require.Equal(t, uint64(25), stats.SymbolTableSize)
+	// The 25-byte symbol table is followed by a 13-byte sampled directory.
+	require.Equal(t, uint64(38), stats.SymbolTableSize)
 }

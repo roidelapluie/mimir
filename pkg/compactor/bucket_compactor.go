@@ -470,8 +470,8 @@ func (c *BucketCompactor) runCompactionJob(ctx context.Context, job *Job) (shoul
 		return false, nil, err
 	}
 
-	// Building sparse-index-headers is required: it is expensive to build a sparse-index-header at block load time,
-	// so every block we upload must already have one.
+	// Legacy indexes need prebuilt sparse index-headers to avoid expensive scans at block load time.
+	// V4 indexes embed both directories, so the builder skips sidecar generation for them.
 	// A failure here fails the compaction job.
 	if err := concurrency.ForEachJob(ctx, uploadBlocksCount, c.blockSyncConcurrency, func(ctx context.Context, idx int) error {
 		blockToUpload := blocksToUpload[idx]

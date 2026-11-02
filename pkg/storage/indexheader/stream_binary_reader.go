@@ -117,21 +117,6 @@ func NewStreamBinaryReader(
 		_ = f.Close()
 	}
 
-	// Attempt to load existing sparse index-header from previous write to local disk or from bucket.
-	// Track whether we loaded it with a boolean -
-	// we cannot necessarily rely on err != nil or the sparse values == nil,
-	// depending on what the failure mode of loading the existing sparse header was.
-	sparseHeaderLoaded := false
-	allSymbolsCount, sparseSymbolsOffsets, sparsePostingsOffsets, err := DownloadAndLoadSparseHeader(
-		ctx, blockID, bkt, dir, sparseSampleFactor, l,
-	)
-	if err != nil {
-		level.Info(spanLog).Log(
-			"msg", "failed to load sparse header from local disk or bucket; must recreate")
-	} else {
-		sparseHeaderLoaded = true
-	}
-
 	headers, err := IndexHeadersOnDisk(localBlockDir)
 	if err != nil {
 		level.Warn(spanLog).Log(
@@ -177,6 +162,14 @@ func NewStreamBinaryReader(
 	filePoolDecbufFactory := streamencoding.NewFilePoolDecbufFactory(
 		localIndexHeaderPath, cfg.MaxIdleFileHandles, metrics.filePool,
 	)
+	initialized := false
+	defer func() {
+		if !initialized {
+			if closeErr := filePoolDecbufFactory.Close(); closeErr != nil {
+				level.Warn(spanLog).Log("msg", "failed to close index-header file pool after initialization failure", "err", closeErr)
+			}
+		}
+	}()
 	var indexHeaderTOC *TOCCompat
 	var indexHeaderVersion int
 	initialTOCErr := func() error {
@@ -272,6 +265,32 @@ func NewStreamBinaryReader(
 		streamBinaryReader.postingsOffsetsTOC = indexHeaderTOC
 	}
 
+	var (
+		allSymbolsCount       int
+		sparseSymbolsOffsets  []int
+		sparsePostingsOffsets map[string]*streamindex.SparseTableOffsetsForLabel
+	)
+	sparseHeaderLoaded := false
+	if indexHeaderTOC.IndexVersion == index.FormatV4 {
+		// V4 carries both directories in the index, so never fetch or create a sparse sidecar.
+		allSymbolsCount, sparseSymbolsOffsets, err = streamindex.SparseValuesFromV4SymbolsTable(
+			ctx, filePoolDecbufFactory, int(indexHeaderTOC.Symbols), int(indexHeaderTOC.SymbolsEnd), cfg.VerifyOnLoad,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("load embedded symbol directory: %w", err)
+		}
+		sparseHeaderLoaded = true
+	} else {
+		allSymbolsCount, sparseSymbolsOffsets, sparsePostingsOffsets, err = DownloadAndLoadSparseHeader(
+			ctx, blockID, bkt, dir, sparseSampleFactor, l,
+		)
+		if err != nil {
+			level.Info(spanLog).Log("msg", "failed to load sparse header from local disk or bucket; must recreate")
+		} else {
+			sparseHeaderLoaded = true
+		}
+	}
+
 	// Required index-header section(s) are now on disk.
 	// If we previously failed to load the sparse index-header, build it now from the index-header.
 	// With index-header version 2, the Postings Offsets table is not on disk and is read from the bucket.
@@ -356,6 +375,7 @@ func NewStreamBinaryReader(
 		return nil, fmt.Errorf("failed to build symbols cache for label names: %w", err)
 	}
 
+	initialized = true
 	return streamBinaryReader, nil
 }
 

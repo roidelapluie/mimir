@@ -7,7 +7,9 @@ package indexheader
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -24,7 +26,6 @@ import (
 	"github.com/thanos-io/objstore"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
-	"golang.org/x/sync/errgroup"
 
 	streamindex "github.com/grafana/mimir/pkg/storage/indexheader/index"
 )
@@ -123,7 +124,7 @@ type unloadRequest struct {
 // on the local disk at dir location, this function will build it downloading required
 // sections from the full index stored in the bucket. However, this function doesn't load
 // (mmap or streaming read) the index-header; it will be loaded at first Reader function call.
-// NewLazyBinaryReader tries to download the sparse index header from the bucket and save it on disk.
+// For legacy indexes, NewLazyBinaryReader tries to download the sparse index header to disk.
 // It does not try to parse the sparse index header.
 func NewLazyBinaryReader(
 	ctx context.Context,
@@ -148,20 +149,20 @@ func NewLazyBinaryReader(
 		_ = df.Close()
 	}
 
-	g := errgroup.Group{}
-	g.Go(func() error {
-		return ensureIndexHeaderOnDisk(ctx, id, bkt, localDir, cfg, logger)
-	})
+	if err := ensureIndexHeaderOnDisk(ctx, id, bkt, localDir, cfg, logger); err != nil {
+		return nil, err
+	}
 
-	g.Go(func() error {
-		err := downloadSparseHeaderToDisk(ctx, id, bkt, localDir, logger)
-		if err != nil {
+	// Read only the fixed header to avoid downloading a sidecar for self-contained V4 indexes.
+	// A damaged fixed header is repaired by the streaming reader when it is first loaded.
+	indexVersion, err := readIndexVersionFromHeader(headerPath)
+	if err != nil {
+		level.Debug(logger).Log("msg", "could not read index version from index-header", "err", err)
+	}
+	if indexVersion == index.FormatV2 {
+		if err := downloadSparseHeaderToDisk(ctx, id, bkt, localDir, logger); err != nil {
 			level.Info(logger).Log("msg", "could not download sparse index-header from bucket; will reconstruct when the block is queried", "err", err)
 		}
-		return nil
-	})
-	if err := g.Wait(); err != nil {
-		return nil, err
 	}
 
 	reader := &LazyBinaryReader{
@@ -182,6 +183,27 @@ func NewLazyBinaryReader(
 
 	go reader.controlLoop()
 	return reader, nil
+}
+
+// readIndexVersionFromHeader reads the TSDB version without loading either index-header table.
+func readIndexVersionFromHeader(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	var header [6]byte
+	_, readErr := io.ReadFull(f, header[:])
+	closeErr := f.Close()
+	if readErr != nil {
+		return 0, readErr
+	}
+	if closeErr != nil {
+		return 0, closeErr
+	}
+	if binary.BigEndian.Uint32(header[:4]) != MagicIndex || (header[4] != BinaryFormatV1 && header[4] != BinaryFormatV2) {
+		return 0, errors.New("invalid index-header prefix")
+	}
+	return int(header[5]), nil
 }
 
 // ensureIndexHeaderOnDisk builds an index-header of the version required from the bucket if it is not already on disk,

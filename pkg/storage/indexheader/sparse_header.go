@@ -262,7 +262,8 @@ func unzipSparseHeader(gZippedSparseData []byte, l log.Logger) ([]byte, error) {
 }
 
 // BuildAndWriteSparseHeaderFromTSDBIndex builds the sparse index-header from the full Prometheus block index on disk
-// and writes it to disk in the same directory.
+// and writes it to disk in the same directory for legacy index formats.
+// V4 embeds its directories in the index and does not need a sparse sidecar.
 // This can be used to generate sparse headers in components with a full block index on disk:
 // classic ingesters, block-builders, and compactors.
 func BuildAndWriteSparseHeaderFromTSDBIndex(
@@ -284,6 +285,14 @@ func BuildAndWriteSparseHeaderFromTSDBIndex(
 	indexTOC, err := tocFromDiskTSDBIndex(blockID, dir)
 	if err != nil {
 		return err
+	}
+
+	if indexTOC.IndexVersion == index.FormatV4 {
+		// Remove an obsolete derived sidecar if this block directory is being reused.
+		if err := os.Remove(sparseHeaderPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove obsolete V4 sparse index-header: %w", err)
+		}
+		return nil
 	}
 
 	allSymbolsCount, sparseSymbolsOffsets, sparsePostingsOffsets, err := buildInMemorySparseHeaderFromIndexHeader(
@@ -331,16 +340,18 @@ func buildInMemorySparseHeaderFromIndexHeader(
 	}()
 	level.Info(l).Log("msg", "creating sparse index-header from full index-header")
 
+	if symbols.toc.IndexVersion == index.FormatV4 {
+		allSymbolsCount, sparseSymbolsOffsets, err = streamindex.SparseValuesFromV4SymbolsTable(
+			ctx, symbols.decbufFactory, int(symbols.toc.Symbols), int(symbols.toc.SymbolsEnd), doChecksum,
+		)
+		return allSymbolsCount, sparseSymbolsOffsets, nil, err
+	}
+
 	allSymbolsCount, sparseSymbolsOffsets, err = streamindex.SparseValuesFromSymbolsTableWithVersion(
 		ctx, symbols.decbufFactory, int(symbols.toc.Symbols), doChecksum, symbols.toc.IndexVersion,
 	)
 	if err != nil {
 		return -1, nil, nil, err
-	}
-
-	// V4 already carries a sampled page directory; only symbols need a sparse sidecar.
-	if postingsOffsets.toc.IndexVersion == index.FormatV4 {
-		return allSymbolsCount, sparseSymbolsOffsets, map[string]*streamindex.SparseTableOffsetsForLabel{}, nil
 	}
 
 	sparsePostingsOffsets, err = streamindex.SparseValuesFromPostingsOffsetsTable(ctx, postingsOffsets.decbufFactory, int(postingsOffsets.toc.PostingsOffsetTable), postingsOffsets.toc.PostingsListEnd, sparseSampleFactor, doChecksum)

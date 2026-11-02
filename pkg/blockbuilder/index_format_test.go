@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	mimir_tsdb "github.com/grafana/mimir/pkg/storage/tsdb"
+	blockmeta "github.com/grafana/mimir/pkg/storage/tsdb/block"
 	"github.com/grafana/mimir/pkg/util/validation"
 )
 
@@ -28,6 +29,7 @@ func TestTSDBBuilderIndexFormat(t *testing.T) {
 			limits := map[string]*validation.Limits{tenant: {TSDBIndexV4Enabled: enabled, OutOfOrderTimeWindow: model.Duration(time.Hour)}}
 			config, overrides := blockBuilderConfig(t, "kafka:9092", validation.NewMockTenantLimits(limits))
 			config.BlocksStorage.TSDB.OutOfOrderCapacityMax = 2
+			config.GenerateSparseIndexHeaders = true
 			logger := log.NewNopLogger()
 			builder := NewTSDBBuilder(0, config, overrides, logger, newTSDBBuilderMetrics(prometheus.NewPedanticRegistry()), mimir_tsdb.NewTSDBMetrics(prometheus.NewPedanticRegistry(), logger))
 			t.Cleanup(func() { require.NoError(t, builder.Close()) })
@@ -54,6 +56,12 @@ func TestTSDBBuilderIndexFormat(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, expectedVersion, reader.Version())
 				require.NoError(t, reader.Close())
+				sparsePath := filepath.Join(dir, block.Meta().ULID.String(), blockmeta.SparseIndexHeaderFilename)
+				if enabled {
+					require.NoFileExists(t, sparsePath)
+				} else {
+					require.FileExists(t, sparsePath)
+				}
 			}
 			_, samples := blockChunks(t, db)
 			expected := []sample{}

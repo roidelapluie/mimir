@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/stretchr/testify/require"
 
+	"github.com/grafana/mimir/pkg/storage/indexheader"
 	"github.com/grafana/mimir/pkg/storage/tsdb/block"
 )
 
@@ -53,6 +54,13 @@ func TestSplitAndMergeCompactorFactory_IndexFormat(t *testing.T) {
 				for _, id := range ids {
 					require.NotEqual(t, ulid.ULID{}, id)
 					path := filepath.Join(outputDir, id.String())
+					require.NoError(t, indexheader.BuildAndWriteSparseHeaderFromTSDBIndex(t.Context(), id, outputDir, 32, log.NewNopLogger()))
+					sparsePath := filepath.Join(path, block.SparseIndexHeaderFilename)
+					if version == index.FormatV4 {
+						require.NoFileExists(t, sparsePath)
+					} else {
+						require.FileExists(t, sparsePath)
+					}
 					reader, err := index.NewFileReader(filepath.Join(path, "index"), index.DecodePostingsRaw)
 					require.NoError(t, err)
 					require.Equal(t, version, reader.Version())
