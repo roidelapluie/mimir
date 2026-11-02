@@ -348,6 +348,7 @@ func (b *TSDBBuilder) newTSDB(tenant tsdbTenant) (*userTSDB, error) {
 		IsolationDisabled:                    true,
 		EnableOverlappingCompaction:          false,                                                // Always false since Mimir only uploads lvl 1 compacted blocks
 		OutOfOrderTimeWindow:                 b.limits.OutOfOrderTimeWindow(userID).Milliseconds(), // The unit must be same as our timestamps.
+		IndexFormatVersion:                   b.limits.IndexFormatVersion(userID),                  // Evaluated when the tenant TSDB opens.
 		FloatChunkEncoding:                   b.limits.FloatChunkEncoding(userID),                  // Evaluated once at creation; no dynamic reload unlike the ingester.
 		EnableHistogramSTEncoding:            b.limits.HistogramSTEncodingEnabled(userID),
 		OutOfOrderCapMax:                     int64(b.cfg.BlocksStorage.TSDB.OutOfOrderCapacityMax),

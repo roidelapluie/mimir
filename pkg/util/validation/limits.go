@@ -260,6 +260,9 @@ type Limits struct {
 	// Native histograms.
 	NativeHistogramsIngestionEnabled bool `yaml:"native_histograms_ingestion_enabled" json:"native_histograms_ingestion_enabled" category:"experimental"`
 
+	// Index format. Resolved when a tenant TSDB opens.
+	TSDBIndexV4Enabled bool `yaml:"tsdb_index_v4_enabled" json:"tsdb_index_v4_enabled" category:"experimental"`
+
 	// Float chunk encoding.
 	FloatChunkEncoding string `yaml:"float_chunk_encoding" json:"float_chunk_encoding" category:"experimental"`
 
@@ -489,6 +492,7 @@ func (l *Limits) RegisterFlags(f *flag.FlagSet) {
 	f.Var(&l.ActiveSeriesBaseCustomTrackersConfig, "ingester.active-series-custom-trackers", "Additional active series metrics, matching the provided matchers. Matchers should be in form <name>:<matcher>, like 'foobar:{foo=\"bar\"}'. Multiple matchers can be provided either providing the flag multiple times or providing multiple semicolon-separated values to a single flag.")
 	f.Var(&l.OutOfOrderTimeWindow, OutOfOrderTimeWindowFlag, fmt.Sprintf("Non-zero value enables out-of-order support for most recent samples that are within the time window in relation to the TSDB's maximum time, i.e., within [db.maxTime-timeWindow, db.maxTime]). The ingester will need more memory as a factor of rate of out-of-order samples being ingested and the number of series that are getting out-of-order samples. If query falls into this window, cached results will use value from -%s option to specify TTL for resulting cache entry.", resultsCacheTTLForOutOfOrderWindowFlag))
 	f.BoolVar(&l.NativeHistogramsIngestionEnabled, "ingester.native-histograms-ingestion-enabled", true, "Enable ingestion of native histogram samples. If false, native histogram samples are ignored without an error. To query native histograms with query-sharding enabled make sure to set -query-frontend.query-result-response-format to 'protobuf'.")
+	f.BoolVar(&l.TSDBIndexV4Enabled, "blocks-storage.tsdb.index-v4-enabled", false, "Write V4 indexes for this tenant in the ingester, block-builder, and compactor. Disabled writes V2 indexes. Changes apply when the tenant TSDB is next opened in the ingester and block-builder, and to the next compaction job in the compactor.")
 	f.StringVar(&l.FloatChunkEncoding, "blocks-storage.tsdb.float-chunk-encoding", DefaultFloatChunkEncodingValue, fmt.Sprintf("Encoding used for float chunks written for this tenant by the ingester and block-builder, and by the compactor when it re-encodes overlapping chunks. Supported values are: %s.", strings.Join(FloatChunkEncodingValues, ", ")))
 	f.StringVar(&l.HistogramChunkEncoding, "blocks-storage.tsdb.histogram-chunk-encoding", DefaultHistogramChunkEncodingValue, fmt.Sprintf("Encoding used for integer and float native histogram chunks written for this tenant by the ingester and block-builder. Supported values are: %s.", strings.Join(HistogramChunkEncodingValues, ", ")))
 	f.BoolVar(&l.OutOfOrderBlocksExternalLabelEnabled, "ingester.out-of-order-blocks-external-label-enabled", false, "Whether the shipper should label out-of-order blocks with an external label before uploading them. Setting this label will compact out-of-order blocks separately from non-out-of-order blocks")
@@ -1531,6 +1535,14 @@ func (o *Overrides) MetricRelabelConfigs(userID string) []*relabel.Config {
 // NativeHistogramsIngestionEnabled returns whether to ingest native histograms in the ingester.
 func (o *Overrides) NativeHistogramsIngestionEnabled(userID string) bool {
 	return o.getOverridesForUser(userID).NativeHistogramsIngestionEnabled
+}
+
+// IndexFormatVersion returns the index format written for this tenant.
+func (o *Overrides) IndexFormatVersion(userID string) int {
+	if o.getOverridesForUser(userID).TSDBIndexV4Enabled {
+		return index.FormatV4
+	}
+	return index.FormatV2
 }
 
 // FloatChunkEncoding returns the float chunk encoding for this tenant.

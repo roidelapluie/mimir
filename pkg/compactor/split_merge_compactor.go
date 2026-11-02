@@ -10,6 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/index"
 
 	util_log "github.com/grafana/mimir/pkg/util/log"
 	"github.com/grafana/mimir/pkg/util/validation"
@@ -35,33 +36,44 @@ func splitAndMergeCompactorFactory(ctx context.Context, cfg Config, cfgProvider 
 	// and they are aggregated across tenants anyway.
 	metrics := tsdb.NewCompactorMetrics(reg)
 
-	// The encoding reaches the merge function through a callback taking no tenant, and jobs for
-	// different tenants compact concurrently, so we build one compactor per encoding.
-	compactors := make(map[chunkenc.Encoding]Compactor, len(validation.FloatChunkEncodingValues))
+	// Jobs for different tenants compact concurrently, so each combination of chunk encoding
+	// and index format has its own compactor. All compactors share the same metrics.
+	type compactorKey struct {
+		encoding    chunkenc.Encoding
+		indexFormat int
+	}
+	compactors := make(map[compactorKey]Compactor, 2*len(validation.FloatChunkEncodingValues))
 	for _, value := range validation.FloatChunkEncodingValues {
 		enc := validation.ParseFloatChunkEncoding(value)
-		compactor, err := tsdb.NewLeveledCompactorWithOptions(ctx, nil, util_log.SlogFromGoKit(logger), blockRanges, nil, tsdb.LeveledCompactorOptions{
-			Metrics:            metrics,
-			FloatChunkEncoding: func() chunkenc.Encoding { return enc },
-			// Inert here, since Mimir plans compaction itself, but NewLeveledCompactor() set it
-			// and this keeps the switch to NewLeveledCompactorWithOptions() behaviour-preserving.
-			EnableOverlappingCompaction: true,
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("creating compactor for float chunk encoding %s: %w", value, err)
+		for _, version := range []int{index.FormatV2, index.FormatV4} {
+			compactor, err := tsdb.NewLeveledCompactorWithOptions(ctx, nil, util_log.SlogFromGoKit(logger), blockRanges, nil, tsdb.LeveledCompactorOptions{
+				Metrics:            metrics,
+				FloatChunkEncoding: func() chunkenc.Encoding { return enc },
+				IndexFormatVersion: version,
+				// Inert here, since Mimir plans compaction itself, but preserves the previous setting.
+				EnableOverlappingCompaction: true,
+			})
+			if err != nil {
+				return nil, nil, fmt.Errorf("creating compactor for float chunk encoding %s and index format %d: %w", value, version, err)
+			}
+			compactor.SetConcurrencyOptions(concurrencyOpts)
+			compactors[compactorKey{encoding: enc, indexFormat: version}] = compactor
 		}
-
-		compactor.SetConcurrencyOptions(concurrencyOpts)
-		compactors[enc] = compactor
 	}
 
-	// A downstream ConfigProvider may return an encoding the limit cannot select.
-	defaultCompactor := compactors[validation.ParseFloatChunkEncoding(validation.DefaultFloatChunkEncodingValue)]
 	provider := func(userID string) Compactor {
-		if compactor, ok := compactors[cfgProvider.FloatChunkEncoding(userID)]; ok {
+		encoding := cfgProvider.FloatChunkEncoding(userID)
+		version := cfgProvider.IndexFormatVersion(userID)
+		// Downstream providers may return values outside the limits. Fall back independently.
+		if version != index.FormatV4 {
+			version = index.FormatV2
+		}
+		key := compactorKey{encoding: encoding, indexFormat: version}
+		if compactor, ok := compactors[key]; ok {
 			return compactor
 		}
-		return defaultCompactor
+		key.encoding = validation.ParseFloatChunkEncoding(validation.DefaultFloatChunkEncodingValue)
+		return compactors[key]
 	}
 
 	return provider, NewSplitAndMergePlanner(blockRanges), nil

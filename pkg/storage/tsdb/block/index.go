@@ -35,7 +35,7 @@ import (
 )
 
 var (
-	SupportedIndexFormats = []int{index.FormatV2}
+	SupportedIndexFormats = []int{index.FormatV2, index.FormatV4}
 )
 
 // VerifyBlock does a full run over a block index and chunk data and verifies that they fulfill the order invariants.
@@ -191,7 +191,7 @@ func GatherBlockHealthStats(ctx context.Context, logger log.Logger, blockDir str
 	stats.IndexFormat = r.Version()
 
 	// NOTE: we can't use Reader.SymbolTableSize() here because it returns in-memory sampled offsets table size.
-	// For the HealthStats use-cases we need the on-disk symbol table size, which is limited to 4 GiB (MaxUint32).
+	// For the HealthStats use-cases we need the on-disk symbol table size.
 	stats.SymbolTableSize, err = readIndexSymbolTableSize(indexFn)
 	if err != nil {
 		return stats, errors.Wrap(err, "read symbol table size")

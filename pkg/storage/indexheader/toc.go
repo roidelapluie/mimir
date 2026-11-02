@@ -42,7 +42,7 @@ type TOCCompat struct {
 	// but is required by pkg/storage/indexheader/index.PostingOffsetTable
 	// to mark the end of the last postings list entry in the index.
 	//
-	// Mimir currently only supports Prometheus index.FormatV2,
+	// Supported Prometheus index formats share the postings section layout,
 	// in which the end of the Postings list is the beginning of the Label Indices table.
 	// Prometheus block index TOC only contains start offsets for sections, not end offsets,
 	// so we use Label Indices Table offset as the end bound of the Postings List.
@@ -50,6 +50,12 @@ type TOCCompat struct {
 
 	// If PostingsOffsetTable is 0, the index or index-header this TOCCompat represents should not be used to resolve postings offsets
 	PostingsOffsetTable uint64
+
+	// PostingsTableOrigin is the absolute TSDB offset before copying into an index-header.
+	PostingsTableOrigin uint64
+
+	// PostingsStart bounds the original TSDB postings section.
+	PostingsStart uint64
 }
 
 // TOCFromBucketTSDBIndex builds the TOCCompat from the full Prometheus block index TOC in the bucket.
@@ -72,7 +78,7 @@ func TOCFromBucketTSDBIndex(
 	}
 
 	indexVersion := int(headerBytes[4])
-	if indexVersion != index.FormatV2 {
+	if indexVersion != index.FormatV2 && indexVersion != index.FormatV4 {
 		return nil, fmt.Errorf("unknown or unsupported index format version %d", indexVersion)
 	}
 
@@ -93,6 +99,8 @@ func TOCFromBucketTSDBIndex(
 		Symbols:             tsdbTOC.Symbols,
 		PostingsListEnd:     postingsListEnd,
 		PostingsOffsetTable: tsdbTOC.PostingsTable,
+		PostingsTableOrigin: tsdbTOC.PostingsTable,
+		PostingsStart:       tsdbTOC.Postings,
 	}, nil
 }
 
@@ -129,7 +137,7 @@ func TOCFromIndexHeader(
 	switch indexHeaderVersion {
 	case BinaryFormatV1, BinaryFormatV2:
 		indexVersion := int(decbuf.Byte())
-		if indexVersion != index.FormatV2 {
+		if indexVersion != index.FormatV2 && indexVersion != index.FormatV4 {
 			return nil, indexHeaderVersion, fmt.Errorf("unknown or unsupported index format version %d", indexVersion)
 		}
 
@@ -160,11 +168,23 @@ func TOCFromIndexHeader(
 			return nil, indexHeaderVersion, fmt.Errorf("index-header format version %d has offset %d for postings offsets table", indexHeaderVersion, postingsOffsetTable)
 		}
 
+		var postingsTableOrigin, postingsStart uint64
+		if indexVersion == index.FormatV4 && postingsOffsetTable != 0 {
+			decbuf.ResetAt(int(postingsOffsetTable))
+			postingsTableOrigin = decbuf.Be64()
+			postingsStart = decbuf.Be64()
+			if decbuf.Err() != nil {
+				return nil, indexHeaderVersion, decbuf.Err()
+			}
+			postingsOffsetTable += 16
+		}
 		return &TOCCompat{
 			IndexVersion:        indexVersion,
 			Symbols:             symbols,
 			PostingsListEnd:     postingsListEnd,
 			PostingsOffsetTable: postingsOffsetTable,
+			PostingsTableOrigin: postingsTableOrigin,
+			PostingsStart:       postingsStart,
 		}, indexHeaderVersion, nil
 	default:
 		return nil, indexHeaderVersion, fmt.Errorf("unknown or unsupported index header format version %d", indexHeaderVersion)
@@ -230,7 +250,7 @@ func tocFromDiskTSDBIndex(blockID ulid.ULID, dir string) (toc *TOCCompat, err er
 	}
 
 	indexVersion := int(indexVersionByte[0])
-	if indexVersion != index.FormatV2 {
+	if indexVersion != index.FormatV2 && indexVersion != index.FormatV4 {
 		return nil, fmt.Errorf("unknown or unsupported index format version %d", indexVersion)
 	}
 
@@ -259,6 +279,8 @@ func tocFromDiskTSDBIndex(blockID ulid.ULID, dir string) (toc *TOCCompat, err er
 
 		PostingsListEnd:     postingsListEnd,
 		PostingsOffsetTable: tsdbTOC.PostingsTable,
+		PostingsTableOrigin: tsdbTOC.PostingsTable,
+		PostingsStart:       tsdbTOC.Postings,
 	}, nil
 
 }

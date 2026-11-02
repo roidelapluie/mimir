@@ -1859,6 +1859,7 @@ func (m *mockBucketFailure) Delete(ctx context.Context, name string) error {
 }
 
 type mockConfigProvider struct {
+	indexFormatVersions          map[string]int
 	floatChunkEncodings          map[string]chunkenc.Encoding
 	userRetentionPeriods         map[string]time.Duration
 	splitAndMergeShards          map[string]int
@@ -1878,6 +1879,7 @@ type mockConfigProvider struct {
 func newMockConfigProvider() *mockConfigProvider {
 	return &mockConfigProvider{
 		floatChunkEncodings:          make(map[string]chunkenc.Encoding),
+		indexFormatVersions:          make(map[string]int),
 		userRetentionPeriods:         make(map[string]time.Duration),
 		splitAndMergeShards:          make(map[string]int),
 		oooSplitAndMergeShards:       make(map[string]int),
@@ -1946,6 +1948,10 @@ func (m *mockConfigProvider) CompactorBlockUploadVerifyChunks(tenantID string) b
 
 func (m *mockConfigProvider) CompactorBlockUploadMaxBlockSizeBytes(user string) int64 {
 	return m.blockUploadMaxBlockSizeBytes[user]
+}
+
+func (m *mockConfigProvider) IndexFormatVersion(userID string) int {
+	return m.indexFormatVersions[userID]
 }
 
 func (m *mockConfigProvider) FloatChunkEncoding(userID string) chunkenc.Encoding {

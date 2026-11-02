@@ -8,8 +8,10 @@ package index
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
 
 	"github.com/grafana/dskit/runutil"
+	"github.com/prometheus/prometheus/tsdb/index"
 
 	streamencoding "github.com/grafana/mimir/pkg/storage/indexheader/encoding"
 	"github.com/grafana/mimir/pkg/storage/indexheader/indexheaderpb"
@@ -21,8 +23,19 @@ func SparseValuesFromSymbolsTable(
 	tableOffset int,
 	doChecksum bool,
 ) (allSymbolsCount int, sparseSymbolsOffsets []int, err error) {
+	return SparseValuesFromSymbolsTableWithVersion(ctx, decbufFactory, tableOffset, doChecksum, index.FormatV2)
+}
+
+// SparseValuesFromSymbolsTableWithVersion samples symbols using the selected index framing.
+func SparseValuesFromSymbolsTableWithVersion(ctx context.Context, decbufFactory streamencoding.DecbufFactory, tableOffset int, doChecksum bool, version int) (allSymbolsCount int, sparseSymbolsOffsets []int, err error) {
 	var decbuf streamencoding.Decbuf
-	if doChecksum {
+	if version == index.FormatV4 {
+		var table *crc32.Table
+		if doChecksum {
+			table = castagnoliTable
+		}
+		decbuf = streamencoding.NewDecbufAt64(ctx, decbufFactory, tableOffset, table)
+	} else if doChecksum {
 		decbuf = decbufFactory.NewDecbufAtChecked(ctx, tableOffset, castagnoliTable)
 	} else {
 		decbuf = decbufFactory.NewDecbufAtUnchecked(ctx, tableOffset)
@@ -50,6 +63,9 @@ func SparseValuesFromSymbolsTable(
 
 	// Get symbols count; decbuf has already consumed the len field.
 	allSymbolsCount = decbuf.Be32int()
+	if decbuf.Err() != nil || allSymbolsCount < 0 || allSymbolsCount > decbuf.Len()-crc32.Size {
+		return -1, nil, streamencoding.ErrInvalidSize
+	}
 
 	seen := 0
 	sparseSymbolsOffsets = make([]int, 0, 1+allSymbolsCount/symbolFactor)
@@ -65,6 +81,9 @@ func SparseValuesFromSymbolsTable(
 		return -1, nil, decbuf.Err()
 	}
 
+	if version == index.FormatV4 && decbuf.Len() != crc32.Size {
+		return -1, nil, streamencoding.ErrInvalidSize
+	}
 	return allSymbolsCount, sparseSymbolsOffsets, nil
 }
 

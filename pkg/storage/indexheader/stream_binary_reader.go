@@ -319,12 +319,17 @@ func NewStreamBinaryReader(
 
 	// DecbufFactory and TOC for each section are now assigned according to their configured sources.
 	// Finally, initialize the readers for each index-header section.
-	streamBinaryReader.postingsOffsetTable, err = streamindex.NewPostingsOffsetsTableReader(
-		streamBinaryReader.postingsOffsetsTOC.IndexVersion,
-		streamBinaryReader.postingsOffsetsDecbufFactory,
-		int(streamBinaryReader.postingsOffsetsTOC.PostingsOffsetTable),
-		sparsePostingsOffsets, sparseSampleFactor,
-	)
+	if streamBinaryReader.postingsOffsetsTOC.IndexVersion == index.FormatV4 {
+		toc := streamBinaryReader.postingsOffsetsTOC
+		streamBinaryReader.postingsOffsetTable, err = streamindex.NewPostingsOffsetsTableV4(ctx, streamBinaryReader.postingsOffsetsDecbufFactory, toc.PostingsOffsetTable, toc.PostingsTableOrigin, toc.PostingsStart, toc.PostingsListEnd)
+	} else {
+		streamBinaryReader.postingsOffsetTable, err = streamindex.NewPostingsOffsetsTableReader(
+			streamBinaryReader.postingsOffsetsTOC.IndexVersion,
+			streamBinaryReader.postingsOffsetsDecbufFactory,
+			int(streamBinaryReader.postingsOffsetsTOC.PostingsOffsetTable),
+			sparsePostingsOffsets, sparseSampleFactor,
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize postings offset table reader: %w", err)
 	}

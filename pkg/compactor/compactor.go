@@ -295,6 +295,9 @@ type ConfigProvider interface {
 	// CompactorMaxPerBlockUploadConcurrency returns the maximum number of TSDB files that can be uploaded concurrently for each block.
 	CompactorMaxPerBlockUploadConcurrency(userID string) int
 
+	// IndexFormatVersion returns the index format written for a given user.
+	IndexFormatVersion(userID string) int
+
 	// FloatChunkEncoding returns the encoding to use for float chunks written for a given user.
 	// An encoding that no -blocks-storage.tsdb.float-chunk-encoding value selects is treated as the default.
 	FloatChunkEncoding(userID string) chunkenc.Encoding

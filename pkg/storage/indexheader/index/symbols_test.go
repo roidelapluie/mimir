@@ -6,7 +6,6 @@
 package index
 
 import (
-	"context"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -29,20 +28,32 @@ func TestMain(m *testing.M) {
 	test.VerifyNoLeakTestMain(m)
 }
 
-func TestSymbolsV2(t *testing.T) {
+func TestSymbols(t *testing.T) {
+	for _, version := range []int{index.FormatV2, index.FormatV4} {
+		t.Run(fmt.Sprintf("V%d", version), func(t *testing.T) { testSymbols(t, version) })
+	}
+}
+
+func testSymbols(t *testing.T, version int) {
 	buf := encoding.Encbuf{}
 
 	// Add prefix to the buffer to simulate symbols as part of larger buffer.
 	buf.PutUvarintStr("something")
 
 	symbolsStart := buf.Len()
-	buf.PutBE32int(204) // Length of symbols table.
+	lengthSize := 4
+	if version == index.FormatV4 {
+		lengthSize = 8
+		buf.PutBE64(204)
+	} else {
+		buf.PutBE32int(204)
+	}
 	buf.PutBE32int(100) // Number of symbols.
 	for i := 0; i < 100; i++ {
 		// i represents index in unicode characters table.
 		buf.PutUvarintStr(string(rune(i))) // Symbol.
 	}
-	checksum := crc32.Checksum(buf.Get()[symbolsStart+4:], castagnoliTable)
+	checksum := crc32.Checksum(buf.Get()[symbolsStart+lengthSize:], castagnoliTable)
 	buf.PutBE32(checksum) // Check sum at the end.
 
 	dir := t.TempDir()
@@ -66,11 +77,12 @@ func TestSymbolsV2(t *testing.T) {
 	}
 
 	for factoryName, decbufFactory := range factories {
-		allSymbolsCount, sparseOffsets, err := SparseValuesFromSymbolsTable(context.Background(), decbufFactory, symbolsStart, true)
+		t.Cleanup(func() { require.NoError(t, decbufFactory.Close()) })
+		allSymbolsCount, sparseOffsets, err := SparseValuesFromSymbolsTableWithVersion(t.Context(), decbufFactory, symbolsStart, true, version)
 		require.NoError(t, err)
 
 		s, err := NewSymbolsTableReader(
-			index.FormatV2, decbufFactory, symbolsStart, allSymbolsCount, sparseOffsets,
+			version, decbufFactory, symbolsStart, allSymbolsCount, sparseOffsets,
 		)
 		require.NoError(t, err)
 

@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
@@ -845,11 +846,14 @@ func TestSplitAndMergeCompactorFactory_ShouldFailOnEmptyBlockRanges(t *testing.T
 
 func TestSplitAndMergeCompactorFactory_VerticalCompactionHonorsFloatChunkEncoding(t *testing.T) {
 	tests := map[string]struct {
-		encoding    chunkenc.Encoding
-		expectedEnc chunkenc.Encoding
+		encoding     chunkenc.Encoding
+		indexVersion int
+		expectedEnc  chunkenc.Encoding
 	}{
 		"unset falls back to the default": {expectedEnc: chunkenc.EncXOR},
 		"xor2":                            {encoding: chunkenc.EncXOR2, expectedEnc: chunkenc.EncXOR2},
+		"xor2 with V4 index":              {encoding: chunkenc.EncXOR2, indexVersion: index.FormatV4, expectedEnc: chunkenc.EncXOR2},
+		"invalid encoding with V4 index":  {encoding: chunkenc.EncHistogram, indexVersion: index.FormatV4, expectedEnc: chunkenc.EncXOR},
 		// A ConfigProvider is free to return an encoding the limit cannot select.
 		"encoding outside the limit falls back to the default": {encoding: chunkenc.EncHistogram, expectedEnc: chunkenc.EncXOR},
 	}
@@ -859,6 +863,7 @@ func TestSplitAndMergeCompactorFactory_VerticalCompactionHonorsFloatChunkEncodin
 			const userID = "user-1"
 
 			cfgProvider := newMockConfigProvider()
+			cfgProvider.indexFormatVersions[userID] = testData.indexVersion
 			if testData.encoding != chunkenc.EncNone {
 				cfgProvider.floatChunkEncodings[userID] = testData.encoding
 			}

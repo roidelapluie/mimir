@@ -92,6 +92,13 @@ func (d *Decbuf) Skip(l int) {
 // next varint-prefixed bytes. If E is non-nil, this method has no effect.
 func (d *Decbuf) SkipUvarintBytes() {
 	l := d.Uvarint64()
+	if d.E != nil {
+		return
+	}
+	if l > uint64(d.r.Len()) {
+		d.E = ErrInvalidSize
+		return
+	}
 	d.Skip(int(l))
 }
 
@@ -127,6 +134,10 @@ func (d *Decbuf) UvarintStr() string {
 func (d *Decbuf) UnsafeUvarintBytes() []byte {
 	l := d.Uvarint64()
 	if d.E != nil {
+		return nil
+	}
+	if l > uint64(d.r.Len()) {
+		d.E = ErrInvalidSize
 		return nil
 	}
 
@@ -192,6 +203,20 @@ func (d *Decbuf) Uvarint64() uint64 {
 	}
 
 	return x
+}
+
+// Bytes reads n bytes into an owned slice and consumes them.
+func (d *Decbuf) Bytes(n int) []byte {
+	if d.E != nil {
+		return nil
+	}
+	if n < 0 {
+		d.E = ErrInvalidSize
+		return nil
+	}
+	b, err := d.r.Read(n)
+	d.E = err
+	return b
 }
 
 func (d *Decbuf) Be64() uint64 {

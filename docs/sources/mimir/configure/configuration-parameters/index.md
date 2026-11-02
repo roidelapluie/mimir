@@ -4764,6 +4764,13 @@ The `limits` block configures default and per-tenant limits imposed by component
 # CLI flag: -ingester.native-histograms-ingestion-enabled
 [native_histograms_ingestion_enabled: <boolean> | default = true]
 
+# (experimental) Write V4 indexes for this tenant in the ingester,
+# block-builder, and compactor. Disabled writes V2 indexes. Changes apply when
+# the tenant TSDB is next opened in the ingester and block-builder, and to the
+# next compaction job in the compactor.
+# CLI flag: -blocks-storage.tsdb.index-v4-enabled
+[tsdb_index_v4_enabled: <boolean> | default = false]
+
 # (experimental) Encoding used for float chunks written for this tenant by the
 # ingester and block-builder, and by the compactor when it re-encodes
 # overlapping chunks. Supported values are: xor, xor2.

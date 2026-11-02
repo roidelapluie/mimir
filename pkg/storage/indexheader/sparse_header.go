@@ -19,6 +19,7 @@ import (
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/runutil"
 	"github.com/oklog/ulid/v2"
+	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/thanos-io/objstore"
 
 	streamencoding "github.com/grafana/mimir/pkg/storage/indexheader/encoding"
@@ -330,11 +331,16 @@ func buildInMemorySparseHeaderFromIndexHeader(
 	}()
 	level.Info(l).Log("msg", "creating sparse index-header from full index-header")
 
-	allSymbolsCount, sparseSymbolsOffsets, err = streamindex.SparseValuesFromSymbolsTable(
-		ctx, symbols.decbufFactory, int(symbols.toc.Symbols), doChecksum,
+	allSymbolsCount, sparseSymbolsOffsets, err = streamindex.SparseValuesFromSymbolsTableWithVersion(
+		ctx, symbols.decbufFactory, int(symbols.toc.Symbols), doChecksum, symbols.toc.IndexVersion,
 	)
 	if err != nil {
 		return -1, nil, nil, err
+	}
+
+	// V4 already carries a sampled page directory; only symbols need a sparse sidecar.
+	if postingsOffsets.toc.IndexVersion == index.FormatV4 {
+		return allSymbolsCount, sparseSymbolsOffsets, map[string]*streamindex.SparseTableOffsetsForLabel{}, nil
 	}
 
 	sparsePostingsOffsets, err = streamindex.SparseValuesFromPostingsOffsetsTable(ctx, postingsOffsets.decbufFactory, int(postingsOffsets.toc.PostingsOffsetTable), postingsOffsets.toc.PostingsListEnd, sparseSampleFactor, doChecksum)

@@ -125,7 +125,7 @@ func writeIndexHeaderFile(
 	}
 	defer runutil.CloseWithErrCapture(&err, bw, "close binary writer for %s", tmpFilename)
 
-	// Mimir currently only supports Prometheus index.FormatV2,
+	// Supported Prometheus index formats share the postings section layout,
 	// in which the end of the Postings list is the beginning of the Label Indices table.
 	// Prometheus block index TOC only contains start offsets for sections, not end offsets,
 	// so we use Label Indices Table offset as the end bound of the Postings List.
@@ -228,6 +228,9 @@ func buildV2FromV1(v1Path, blockDir string, v1TOC *TOCCompat) (err error) {
 	defer runutil.CloseWithErrCapture(&err, v1File, "close v1 index-header %s", v1Path)
 
 	symbolsLen := int64(v1TOC.PostingsOffsetTable - v1TOC.Symbols)
+	if v1TOC.IndexVersion == index.FormatV4 {
+		symbolsLen -= 16 // Exclude the copied postings table origin and lower bound.
+	}
 	symbolsReader := io.NewSectionReader(v1File, int64(v1TOC.Symbols), symbolsLen)
 	copySymbols := func(w io.Writer, buf []byte) error {
 		_, err := io.CopyBuffer(w, symbolsReader, buf)
@@ -243,11 +246,12 @@ func buildV2FromV1(v1Path, blockDir string, v1TOC *TOCCompat) (err error) {
 }
 
 type chunkedIndexReader struct {
-	ctx  context.Context
-	path string
-	size uint64
-	bkt  objstore.BucketReader
-	toc  *index.TOC
+	ctx     context.Context
+	path    string
+	size    uint64
+	bkt     objstore.BucketReader
+	toc     *index.TOC
+	version int
 }
 
 func newChunkedIndexReader(ctx context.Context, bkt objstore.BucketReader, id ulid.ULID, indexHeaderVersion int) (*chunkedIndexReader, int, error) {
@@ -288,15 +292,16 @@ func newChunkedIndexReader(ctx context.Context, bkt objstore.BucketReader, id ul
 	}
 
 	version := int(b[4:5][0])
-	if version != index.FormatV2 {
+	if version != index.FormatV2 && version != index.FormatV4 {
 		return nil, 0, errors.Errorf("not supported index file version %d of %s", version, indexFilepath)
 	}
 
 	ir := &chunkedIndexReader{
-		ctx:  ctx,
-		path: indexFilepath,
-		size: uint64(attrs.Size),
-		bkt:  bkt,
+		ctx:     ctx,
+		version: version,
+		path:    indexFilepath,
+		size:    uint64(attrs.Size),
+		bkt:     bkt,
 	}
 
 	toc, err := ir.readTOC()
@@ -346,6 +351,15 @@ func (r *chunkedIndexReader) CopySymbols(w io.Writer, buf []byte) (err error) {
 }
 
 func (r *chunkedIndexReader) CopyPostingsOffsets(w io.Writer, buf []byte) (err error) {
+	// V4 page offsets are absolute in the source index. Preserve their origin when copying.
+	if r.version == index.FormatV4 {
+		var origin [16]byte
+		binary.BigEndian.PutUint64(origin[:8], r.toc.PostingsTable)
+		binary.BigEndian.PutUint64(origin[8:], r.toc.Postings)
+		if _, err := w.Write(origin[:]); err != nil {
+			return err
+		}
+	}
 	rc, err := r.bkt.GetRange(r.ctx, r.path, int64(r.toc.PostingsTable), int64(r.size-r.toc.PostingsTable))
 	if err != nil {
 		return errors.Wrapf(err, "get posting offset table from object storage of %s", r.path)

@@ -79,6 +79,11 @@ func TestHealthStats_AnyErr(t *testing.T) {
 			},
 			expectSuccess: true,
 		},
+		{
+			name:          "V4 index",
+			stats:         HealthStats{IndexFormat: index.FormatV4},
+			expectSuccess: true,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -234,4 +239,20 @@ func TestUpdateStatsCountsSamplesByEncoding(t *testing.T) {
 	require.Equal(t, uint64(7), stats.NumSamples)
 	require.Equal(t, uint64(3), stats.NumFloatSamples)
 	require.Equal(t, uint64(4), stats.NumHistogramSamples)
+}
+
+func TestGatherBlockHealthStats_IndexV4(t *testing.T) {
+	dir := t.TempDir()
+	w, err := index.NewWriterWithOptions(t.Context(), filepath.Join(dir, IndexFilename), index.WriterOptions{FormatVersion: index.FormatV4})
+	require.NoError(t, err)
+	require.NoError(t, w.AddSymbol("job"))
+	require.NoError(t, w.AddSymbol("test"))
+	require.NoError(t, w.AddSeries(0, labels.FromStrings("job", "test"), chunks.Meta{Ref: 0, MinTime: 0, MaxTime: 9}))
+	require.NoError(t, w.Close())
+	stats, err := GatherBlockHealthStats(t.Context(), log.NewNopLogger(), dir, 0, 10, false)
+	require.NoError(t, err)
+	require.NoError(t, stats.AnyErr())
+	require.Equal(t, index.FormatV4, stats.IndexFormat)
+	require.Equal(t, int64(1), stats.TotalSeries)
+	require.Equal(t, uint64(25), stats.SymbolTableSize)
 }
