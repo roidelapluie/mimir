@@ -44,7 +44,7 @@ func (d *Decbuf) CheckCrc32(castagnoliTable *crc32.Table) {
 
 	hash := crc32.New(castagnoliTable)
 	bytesToRead := d.r.Len() - 4
-	maxChunkSize := 1024 * 1024
+	maxChunkSize := min(bytesToRead, 1024*1024)
 	rawBuf := make([]byte, maxChunkSize)
 
 	for bytesToRead > 0 {

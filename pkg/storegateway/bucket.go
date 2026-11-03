@@ -1577,6 +1577,12 @@ func blockLabelValues(ctx context.Context, b *bucketBlock, postingsStrategy post
 
 	// There are some matchers, check to see if any apply to this label name as a prefix or exact match to minimize our postings strategy surface area.
 	matchStr, isExactMatch := exactMatchOrPrefixForLabelName(labelName, matchers)
+	if values, supported, err := blockLabelValuesFromDirectory(ctx, b, postingsStrategy, maxSeriesPerBatch, labelName, matchStr, isExactMatch, matchers, stats); err != nil {
+		return nil, err
+	} else if supported {
+		storeCachedLabelValues(ctx, b.indexCache, b.userID, b.meta.ULID, labelName, matchers, values, logger)
+		return values, nil
+	}
 
 	var allApplicableValuesPostingsOffsets []streamindex.PostingListOffset
 

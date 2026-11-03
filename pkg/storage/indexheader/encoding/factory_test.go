@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"io"
+	"math"
 	"os"
 	"path"
 	"testing"
@@ -343,4 +345,60 @@ func createDecbufFactoriesWithBytes(t testing.TB, filePoolSize uint, len int, en
 	bucketFactory := NewBucketDecbufFactory(instBkt, fileName)
 
 	return diskFactory, bucketFactory
+}
+
+func TestBucketDecbufFactory_ReadRange(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		offset, size int
+		want         string
+		err          error
+		requests     int
+	}{
+		{name: "exact", offset: 2, size: 5, want: "cdefg", requests: 1},
+		{name: "empty", offset: 2},
+		{name: "negative offset", offset: -1, size: 5, err: ErrInvalidSize},
+		{name: "negative size", size: -1, err: ErrInvalidSize},
+		{name: "overflow", offset: math.MaxInt, size: 1, err: ErrInvalidSize},
+		{name: "truncated", offset: len(testBucketContents) - 1, size: 2, err: io.ErrUnexpectedEOF, requests: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bucket := newTrackingBucket(t, testBucketContents)
+			factory := NewBucketDecbufFactory(bucket, testBucketObjectName)
+			data, err := factory.ReadRange(t.Context(), tc.offset, tc.size)
+			if tc.err != nil {
+				require.ErrorIs(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.want, string(data))
+			}
+			require.Len(t, bucket.calls, tc.requests)
+			if tc.requests != 0 {
+				require.Equal(t, rangeCall{int64(tc.offset), int64(tc.size)}, bucket.calls[0])
+			}
+		})
+	}
+	t.Run("cancelled", func(t *testing.T) {
+		bucket := newTrackingBucket(t, testBucketContents)
+		factory := NewBucketDecbufFactory(bucket, testBucketObjectName)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, err := factory.ReadRange(ctx, 0, 5)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Empty(t, bucket.calls)
+	})
+}
+
+func TestBucketDecbufFactory_Size(t *testing.T) {
+	bucket := newTrackingBucket(t, testBucketContents)
+	factory := NewBucketDecbufFactory(bucket, testBucketObjectName)
+	size, err := factory.Size(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, len(testBucketContents), size)
+	require.Empty(t, bucket.calls)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = factory.Size(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Empty(t, bucket.calls)
 }

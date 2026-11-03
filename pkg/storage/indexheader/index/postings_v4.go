@@ -28,6 +28,7 @@ type pagedSource struct {
 	origin, local uint64
 }
 
+// Read operations return owned bytes that remain valid after closing the underlying reader.
 func (s *pagedSource) read(ctx context.Context, off, size uint64) (_ []byte, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -36,6 +37,15 @@ func (s *pagedSource) read(ctx context.Context, off, size uint64) (_ []byte, err
 		return nil, encoding.ErrInvalidSize
 	}
 	local := off - s.origin + s.local
+	if size > math.MaxInt-local {
+		return nil, encoding.ErrInvalidSize
+	}
+	if reader, ok := s.factory.(interface {
+		// ReadRange returns an owned copy that the factory must not reuse.
+		ReadRange(context.Context, int, int) ([]byte, error)
+	}); ok {
+		return reader.ReadRange(ctx, int(local), int(size))
+	}
 	d := s.factory.NewRawDecbuf(ctx)
 	defer runutil.CloseWithErrCapture(&err, &d, "read paged postings")
 	if d.Err() != nil {
@@ -55,22 +65,37 @@ type pagedPostingsTable struct {
 	groups               map[string]*postingsGroup
 	names                []string
 	postingsEnd          uint64
+	sampling             int
 }
 
 // NewPostingsOffsetsTableV4 opens a paged directory and reads value pages on demand.
 // origin is the original TSDB table offset; local is its offset in factory.
 func NewPostingsOffsetsTableV4(ctx context.Context, factory streamencoding.DecbufFactory, local, origin, postingsStart, postingsEnd uint64) (PostingsOffsetsTable, error) {
-	d := factory.NewRawDecbuf(ctx)
-	if d.Err() != nil {
-		err := d.Err()
-		_ = d.Close()
-		return nil, err
+	var size uint64
+	if sized, ok := factory.(interface {
+		Size(context.Context) (int, error)
+	}); ok {
+		n, err := sized.Size(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if n < 0 {
+			return nil, encoding.ErrInvalidSize
+		}
+		size = uint64(n)
+	} else {
+		d := factory.NewRawDecbuf(ctx)
+		if d.Err() != nil {
+			err := d.Err()
+			_ = d.Close()
+			return nil, err
+		}
+		size = uint64(d.Len())
+		if err := d.Close(); err != nil {
+			return nil, err
+		}
 	}
-	size := uint64(d.Len())
-	if err := d.Close(); err != nil {
-		return nil, err
-	}
-	if local > size || origin > math.MaxInt || size-local > math.MaxInt-origin || postingsStart > postingsEnd || postingsEnd > origin {
+	if local > size || origin > math.MaxInt || size-local > math.MaxInt-origin || postingsStart > postingsEnd || postingsEnd != origin {
 		return nil, encoding.ErrInvalidSize
 	}
 	source := &pagedSource{factory: factory, origin: origin, local: local}
@@ -90,7 +115,7 @@ func (r *pagedPostingsTable) IsRemote() bool {
 	_, ok := r.source.factory.(*streamencoding.BucketDecbufFactory)
 	return ok
 }
-func (r *pagedPostingsTable) PostingsOffsetsInMemSampling() int { return 128 }
+func (r *pagedPostingsTable) PostingsOffsetsInMemSampling() int { return max(1, r.sampling) }
 func (r *pagedPostingsTable) LabelNames() ([]string, error) {
 	names := make([]string, 0, len(r.names))
 	for _, name := range r.names {
@@ -101,27 +126,11 @@ func (r *pagedPostingsTable) LabelNames() ([]string, error) {
 	return names, nil
 }
 
-func (r *pagedPostingsTable) entryRange(ctx context.Context, name string, page, entry int, p *postingsPage) (index.Range, error) {
+func (r *pagedPostingsTable) entryRange(entry int, p *postingsPage) (index.Range, error) {
 	start := p.base + p.delta(entry)
-	end := r.postingsEnd
-	g := r.groups[name]
+	end := p.postingsEnd
 	if entry+1 < p.count {
 		end = p.base + p.delta(entry+1)
-	} else if page+1 < len(g.pages) {
-		next, err := r.load(ctx, g, page+1)
-		if err != nil {
-			return index.Range{}, err
-		}
-		end = next.base + next.delta(0)
-	} else {
-		ni, _ := slices.BinarySearch(r.names, name)
-		if ni+1 < len(r.names) {
-			next, err := r.load(ctx, r.groups[r.names[ni+1]], 0)
-			if err != nil {
-				return index.Range{}, err
-			}
-			end = next.base + next.delta(0)
-		}
 	}
 	if start > math.MaxInt64-4 || end < start+8 || end > r.postingsEnd {
 		return index.Range{}, encoding.ErrInvalidSize
@@ -143,7 +152,7 @@ func (r *pagedPostingsTable) PostingsOffset(ctx context.Context, name, value str
 			return index.Range{}, false, nil
 		}
 		suffix := value[len(g.prefix):]
-		pi = sort.Search(len(g.pages), func(i int) bool { return g.pages[i].end >= suffix })
+		pi = sort.Search(len(g.pages), func(i int) bool { return g.fence(i) >= suffix })
 		if pi == len(g.pages) {
 			return index.Range{}, false, nil
 		}
@@ -156,7 +165,7 @@ func (r *pagedPostingsTable) PostingsOffset(ctx context.Context, name, value str
 	if i == p.count || p.value(i) != value {
 		return index.Range{}, false, nil
 	}
-	rng, err := r.entryRange(ctx, name, pi, i, p)
+	rng, err := r.entryRange(i, &p)
 	return rng, err == nil, err
 }
 
@@ -168,25 +177,65 @@ func (r *pagedPostingsTable) LabelValuesOffsets(ctx context.Context, name, prefi
 	if g == nil {
 		return nil, nil
 	}
-	var result []PostingListOffset
-	for pi := range g.pages {
+	first, last := g.prefixPages(prefix)
+	capacity := g.count
+	if first != 0 || last != len(g.pages) {
+		capacity = 0
+		for i := first; i < last; i++ {
+			capacity += g.page(i).count
+		}
+	}
+	result := make([]PostingListOffset, 0, capacity)
+	for pi := first; pi < last; {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		p, err := r.load(ctx, g, pi)
+		// Read consecutive pages together, bounding temporary memory for broad scans.
+		// An individual oversized page remains readable as a batch of one.
+		const targetBatchBytes = 1 << 20
+		offset := g.page(pi).offset
+		end := pi + 1
+		size := uint64(g.page(pi).size)
+		for end < last && g.page(end).offset+uint64(g.page(end).size)-offset <= targetBatchBytes {
+			size = g.page(end).offset + uint64(g.page(end).size) - offset
+			end++
+		}
+		data, err := r.source.read(ctx, offset, size)
 		if err != nil {
 			return nil, err
 		}
-		for i := 0; i < p.count; i++ {
-			value := p.value(i)
-			if !strings.HasPrefix(value, prefix) || filter != nil && !filter(value) {
-				continue
+		for ; pi < end; pi++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
 			}
-			rng, err := r.entryRange(ctx, name, pi, i, p)
+			start := g.page(pi).offset - offset
+			p, err := r.decode(g, pi, data[start:start+uint64(g.page(pi).size)])
 			if err != nil {
 				return nil, err
 			}
-			result = append(result, PostingListOffset{LabelValue: strings.Clone(value), Off: rng})
+			firstEntry := 0
+			if prefix != "" {
+				firstEntry = sort.Search(p.count, func(i int) bool { return p.value(i) >= prefix })
+			}
+			for i := firstEntry; i < p.count; i++ {
+				value := p.value(i)
+				if prefix != "" && !strings.HasPrefix(value, prefix) {
+					break
+				}
+				if filter != nil && !filter(value) {
+					continue
+				}
+				rng, err := r.entryRange(i, &p)
+				if err != nil {
+					return nil, err
+				}
+				// Full scans retain owned batch bytes; filtered scans copy matches
+				// so a small result does not retain unrelated values.
+				if prefix != "" || filter != nil {
+					value = strings.Clone(value)
+				}
+				result = append(result, PostingListOffset{LabelValue: value, Off: rng})
+			}
 		}
 	}
 	return result, nil
@@ -195,18 +244,46 @@ func (r *pagedPostingsTable) LabelValuesOffsets(ctx context.Context, name, prefi
 type postingsGroup struct {
 	prefix string
 	count  int
-	pages  []*postingsPage
+	// Data is immutable, owned directory storage shared by groups in this table.
+	data        []byte
+	pages       []int
+	postingsEnd uint64
+}
+
+type postingsPageDescriptor struct {
+	offset                     uint64
+	postingsStart, postingsEnd uint64
+	size                       uint32
+	count                      int
+	end                        string
 }
 
 type postingsPage struct {
-	offset               uint64
-	size                 uint32
-	count                int
-	end                  string
+	postingsPageDescriptor
 	err                  error
 	starts, deltas, data []byte
 	base                 uint64
 	width                int
+}
+
+func (g *postingsGroup) fence(i int) string {
+	b := g.data[g.pages[i]+24:]
+	length, n := binary.Uvarint(b)
+	return yoloString(b[n : n+int(length)])
+}
+
+// Page decodes one descriptor from directory bytes validated when opening the table.
+func (g *postingsGroup) page(i int) postingsPageDescriptor {
+	b := g.data[g.pages[i]:]
+	end := g.postingsEnd
+	if i+1 < len(g.pages) {
+		end = binary.BigEndian.Uint64(g.data[g.pages[i+1]+16:])
+	}
+	length, n := binary.Uvarint(b[24:])
+	return postingsPageDescriptor{
+		offset: binary.BigEndian.Uint64(b), size: binary.BigEndian.Uint32(b[8:]), count: int(binary.BigEndian.Uint32(b[12:])),
+		postingsStart: binary.BigEndian.Uint64(b[16:]), postingsEnd: end, end: yoloString(b[24+n : 24+n+int(length)]),
+	}
 }
 
 func readPagedPostingsTable(ctx context.Context, source *pagedSource, start, end, postingsStart uint64) (*pagedPostingsTable, error) {
@@ -214,7 +291,7 @@ func readPagedPostingsTable(ctx context.Context, source *pagedSource, start, end
 	if err != nil {
 		return nil, err
 	}
-	if string(h[:8]) != "PPOT0001" || crc32.Checksum(h[:24], castagnoliTable) != binary.BigEndian.Uint32(h[24:]) {
+	if string(h[:8]) != "PPOT0002" || crc32.Checksum(h[:24], castagnoliTable) != binary.BigEndian.Uint32(h[24:]) {
 		return nil, errors.New("invalid paged postings header")
 	}
 	off, size := binary.BigEndian.Uint64(h[8:]), binary.BigEndian.Uint64(h[16:])
@@ -230,24 +307,29 @@ func readPagedPostingsTable(ctx context.Context, source *pagedSource, start, end
 	}
 	d := encoding.Decbuf{B: root[:len(root)-4]}
 	n := d.Be32()
-	if uint64(n) > uint64(d.Len())/23 {
+	if uint64(n) > uint64(d.Len())/31 {
 		return nil, encoding.ErrInvalidSize
 	}
 	r := &pagedPostingsTable{source: source, start: start, postingsStart: postingsStart, groups: make(map[string]*postingsGroup)}
 	previous := ""
 	nextPage := start + 28
 	var total uint64
+	var previousPosting uint64
+	var previousCount uint32
+	var previousGroup *postingsGroup
 	for i := range n {
 		name, prefix := d.UvarintStr(), d.UvarintStr()
 		np := d.Be32()
-		if d.Err() != nil || len(prefix) > 64<<10 || np == 0 || uint64(np) > uint64(d.Len())/17 || i > 0 && name <= previous {
+		if d.Err() != nil || len(prefix) > 64<<10 || np == 0 || uint64(np) > uint64(d.Len())/25 || i > 0 && name <= previous {
 			return nil, errors.New("invalid postings group")
 		}
 		previous = name
-		g := &postingsGroup{prefix: prefix, pages: make([]*postingsPage, 0, np)}
+		g := &postingsGroup{prefix: prefix, data: root[:len(root)-4], pages: make([]int, 0, np), postingsEnd: start}
 		lastEnd := ""
 		for j := range np {
+			position := len(root) - 4 - d.Len()
 			po, ps, count := d.Be64(), d.Be32(), d.Be32()
+			firstPosting := d.Be64()
 			fence := d.UvarintStr()
 			if d.Err() != nil || po != nextPage || po > off || uint64(ps) > off-po || ps < 33 || count == 0 || count > 128 || j > 0 && fence <= lastEnd {
 				return nil, errors.New("invalid postings page descriptor")
@@ -256,11 +338,22 @@ func readPagedPostingsTable(ctx context.Context, source *pagedSource, start, end
 				return nil, encoding.ErrInvalidSize
 			}
 			g.count += int(count)
+			r.sampling = max(r.sampling, int(count))
 			total += uint64(count)
 			if total > math.MaxUint32 {
 				return nil, errors.New("too many postings entries")
 			}
-			g.pages = append(g.pages, &postingsPage{offset: po, size: ps, count: int(count), end: fence})
+			if firstPosting < postingsStart || firstPosting > start || uint64(count)*8 > start-firstPosting {
+				return nil, errors.New("invalid postings page bounds")
+			}
+			if previousCount != 0 && (firstPosting <= previousPosting || firstPosting-previousPosting < uint64(previousCount)*8) {
+				return nil, errors.New("invalid postings page bounds")
+			}
+			if j == 0 && previousGroup != nil {
+				previousGroup.postingsEnd = firstPosting
+			}
+			g.pages = append(g.pages, position)
+			previousPosting, previousCount = firstPosting, count
 			nextPage = po + uint64(ps)
 			lastEnd = fence
 		}
@@ -268,6 +361,7 @@ func readPagedPostingsTable(ctx context.Context, source *pagedSource, start, end
 			return nil, errors.New("invalid single-page routing")
 		}
 		r.groups[name] = g
+		previousGroup = g
 	}
 	if d.Err() != nil || d.Len() != 0 || nextPage != off {
 		return nil, errors.New("invalid postings directory")
@@ -275,15 +369,18 @@ func readPagedPostingsTable(ctx context.Context, source *pagedSource, start, end
 	return r, nil
 }
 
-func (r *pagedPostingsTable) load(ctx context.Context, g *postingsGroup, page int) (*postingsPage, error) {
-	descriptor := *g.pages[page]
-	p := &descriptor
+func (r *pagedPostingsTable) load(ctx context.Context, g *postingsGroup, page int) (postingsPage, error) {
+	p := g.page(page)
+	data, err := r.source.read(ctx, p.offset, uint64(p.size))
+	if err != nil {
+		return postingsPage{}, err
+	}
+	return r.decode(g, page, data)
+}
+
+func (r *pagedPostingsTable) decode(g *postingsGroup, page int, b []byte) (postingsPage, error) {
+	p := postingsPage{postingsPageDescriptor: g.page(page)}
 	func() {
-		b, err := r.source.read(ctx, p.offset, uint64(p.size))
-		if err != nil {
-			p.err = err
-			return
-		}
 		if crc32.Checksum(b[:len(b)-4], castagnoliTable) != binary.BigEndian.Uint32(b[len(b)-4:]) {
 			p.err = encoding.ErrInvalidChecksum
 			return
@@ -304,28 +401,43 @@ func (r *pagedPostingsTable) load(ctx context.Context, g *postingsGroup, page in
 		p.starts = b[20 : 20+4*(n+1)]
 		p.deltas = b[20+4*(n+1) : end]
 		p.data = b[end : end+nb]
-		prev := uint32(0)
-		for i := 0; i <= p.count; i++ {
-			next := binary.BigEndian.Uint32(p.starts[4*i:])
-			if uint64(next) > nb || next < prev || i == 0 && next != 0 || i == p.count && uint64(next) != nb {
+		if binary.BigEndian.Uint32(p.starts) != 0 {
+			p.err = errors.New("invalid postings value offsets")
+			return
+		}
+		var previousStart uint32
+		var previousValue string
+		var previousDelta uint64
+		for i := range p.count {
+			next := binary.BigEndian.Uint32(p.starts[4*(i+1):])
+			if uint64(next) > nb || next < previousStart || i == p.count-1 && uint64(next) != nb {
 				p.err = errors.New("invalid postings value offsets")
 				return
 			}
-			prev = next
-		}
-		for i := range p.count {
-			value := p.value(i)
-			if i > 0 && value <= p.value(i-1) || !strings.HasPrefix(value, g.prefix) {
+			value := yoloString(p.data[previousStart:next])
+			if i > 0 && value <= previousValue {
+				p.err = errors.New("unsorted postings values")
+				return
+			}
+			// Sorted values share the group prefix if both endpoints have it.
+			if (i == 0 || i == p.count-1) && !strings.HasPrefix(value, g.prefix) {
 				p.err = errors.New("unsorted postings values")
 				return
 			}
 			delta := p.delta(i)
-			if delta > math.MaxUint64-p.base || p.base+delta < r.postingsStart || p.base+delta >= r.start {
+			if i == 0 && (p.base != p.postingsStart || delta != 0) || i > 0 && (delta <= previousDelta || delta-previousDelta < 8) {
+				p.err = errors.New("postings offsets do not match page bounds")
+				return
+			}
+			if delta > math.MaxUint64-p.base || p.base+delta < p.postingsStart || p.base+delta > p.postingsEnd-8 {
 				p.err = errors.New("postings offset outside postings section")
 				return
 			}
+			previousStart = next
+			previousValue = value
+			previousDelta = delta
 		}
-		if len(g.pages) > 1 && (p.value(p.count - 1)[len(g.prefix):] != p.end || page > 0 && p.value(0)[len(g.prefix):] <= g.pages[page-1].end) {
+		if len(g.pages) > 1 && (p.value(p.count - 1)[len(g.prefix):] != p.end || page > 0 && p.value(0)[len(g.prefix):] <= g.fence(page-1)) {
 			p.err = errors.New("postings page does not match routing")
 			return
 		}

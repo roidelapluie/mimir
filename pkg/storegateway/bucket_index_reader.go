@@ -194,7 +194,7 @@ func (r *bucketIndexReader) fetchCachedExpandedPostings(ctx context.Context, use
 
 // expandedPostings is the main logic of ExpandedPostings, without the promise wrapper.
 func (r *bucketIndexReader) expandedPostings(ctx context.Context, ms []*labels.Matcher, stats *safeQueryStats) (returnRefs []storage.SeriesRef, pendingMatchers []*labels.Matcher, returnErr error) {
-	postingGroups, err := toPostingGroups(ctx, ms, r.block.indexHeaderReader)
+	postingGroups, deferredMatchers, err := planPostingGroups(ctx, ms, r.block.indexHeaderReader, r.postingsStrategy)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "toPostingGroups")
 	}
@@ -209,7 +209,7 @@ func (r *bucketIndexReader) expandedPostings(ctx context.Context, ms []*labels.M
 	// Explicitly clear the omitted groups here so their keys and offsets aren't retained while postings are fetched.
 	// This shortens how long the omitted groups stay in memory during expansion of postings.
 	// Ref https://github.com/grafana/mimir/issues/16836 for a detailed explanation of the problem.
-	pendingMatchers = extractLabelMatchers(omittedPostingGroups)
+	pendingMatchers = append(deferredMatchers, extractLabelMatchers(omittedPostingGroups)...)
 	clear(omittedPostingGroups)
 
 	keysOffsets := extractKeysOffsets(postingGroups)

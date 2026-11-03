@@ -504,3 +504,11 @@ func (r *StreamBinaryReader) Close() error {
 func (r *StreamBinaryReader) TOC() *TOCCompat {
 	return r.symbolsTOC
 }
+
+// EstimatePostings implements streamindex.PostingsEstimator when the index supports it.
+func (r *StreamBinaryReader) EstimatePostings(ctx context.Context, name, prefix string, values []string) (streamindex.PostingsEstimate, bool, error) {
+	if estimator, ok := r.postingsOffsetTable.(streamindex.PostingsEstimator); ok {
+		return estimator.EstimatePostings(ctx, name, prefix, values)
+	}
+	return streamindex.PostingsEstimate{}, false, ctx.Err()
+}

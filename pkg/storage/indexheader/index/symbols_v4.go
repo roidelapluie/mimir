@@ -130,6 +130,7 @@ func readV4SampleSymbol(d *streamencoding.Decbuf, payloadEnd int) (string, error
 	if d.Err() != nil || d.Offset() > payloadEnd || length > uint64(payloadEnd-d.Offset()) {
 		return "", streamencoding.ErrInvalidSize
 	}
-	value := string(d.Bytes(int(length)))
+	// Bytes returns owned storage that remains valid after decoder reuse.
+	value := yoloString(d.Bytes(int(length)))
 	return value, d.Err()
 }

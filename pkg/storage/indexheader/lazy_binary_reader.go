@@ -521,3 +521,16 @@ func (l *lazySymbolsReader) Close() error {
 	l.once.Do(l.wg.Done)
 	return err
 }
+
+// EstimatePostings loads the directory if needed, then estimates without reading value pages.
+func (r *LazyBinaryReader) EstimatePostings(ctx context.Context, name, prefix string, values []string) (streamindex.PostingsEstimate, bool, error) {
+	loaded := r.getOrLoadReader(ctx)
+	if loaded.err != nil {
+		return streamindex.PostingsEstimate{}, false, loaded.err
+	}
+	defer loaded.inUse.Done()
+	if estimator, ok := loaded.reader.(streamindex.PostingsEstimator); ok {
+		return estimator.EstimatePostings(ctx, name, prefix, values)
+	}
+	return streamindex.PostingsEstimate{}, false, ctx.Err()
+}

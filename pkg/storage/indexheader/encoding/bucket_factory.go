@@ -5,8 +5,11 @@ package encoding
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
+	"math"
 	"sync"
 
 	"github.com/thanos-io/objstore"
@@ -164,4 +167,43 @@ func (bf *BucketDecbufFactory) NewRawDecbuf(ctx context.Context) Decbuf {
 func (bf *BucketDecbufFactory) Close() error {
 	// Nothing to do for bucket-based implementation
 	return nil
+}
+
+// ReadRange returns an owned copy of exactly size bytes at the absolute offset.
+// It does not inspect table framing, issue an attributes request, or read ahead.
+func (bf *BucketDecbufFactory) ReadRange(ctx context.Context, offset, size int) (_ []byte, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if offset < 0 || size < 0 || offset > math.MaxInt-size {
+		return nil, ErrInvalidSize
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	reader, err := bf.bkt.GetRange(ctx, bf.objectPath, int64(offset), int64(size))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.Join(err, reader.Close()) }()
+	data := make([]byte, size)
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// Size returns the object size without allocating a buffered reader.
+func (bf *BucketDecbufFactory) Size(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	attrs, err := bf.bkt.Attributes(ctx, bf.objectPath)
+	if err != nil {
+		return 0, fmt.Errorf("get size from %s: %w", bf.objectPath, err)
+	}
+	if attrs.Size < 0 || attrs.Size > math.MaxInt {
+		return 0, ErrInvalidSize
+	}
+	return int(attrs.Size), nil
 }

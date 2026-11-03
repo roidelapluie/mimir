@@ -4,6 +4,7 @@ package storegateway
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -66,7 +67,11 @@ func TestBucketStore_IndexV4(t *testing.T) {
 			require.NoError(t, err)
 			require.False(t, exists)
 			require.NoFileExists(t, filepath.Join(blockDir, block.SparseIndexHeaderFilename))
-			trackedBucket := &v4SparseReadTrackingBucket{Bucket: bkt}
+			rawIndex, err := os.ReadFile(filepath.Join(blockDir, block.IndexFilename))
+			require.NoError(t, err)
+			toc, err := index.NewTOCFromByteSlice(v4IndexBytes(rawIndex))
+			require.NoError(t, err)
+			trackedBucket := &v4SparseReadTrackingBucket{Bucket: bkt, pageStart: int64(toc.PostingsTable) + 28, pageEnd: int64(binary.BigEndian.Uint64(rawIndex[toc.PostingsTable+8:]))}
 			instrBkt := objstore.WithNoopInstr(trackedBucket)
 			fetcher, err := block.NewMetaFetcher(logger, 1, instrBkt, "", nil, nil, 0)
 			require.NoError(t, err)
@@ -92,7 +97,7 @@ func TestBucketStore_IndexV4(t *testing.T) {
 						require.NoError(t, closeErr)
 					}
 					store, err := NewBucketStore("tenant", instrBkt, newTestBucketIndexMetadataReader(t, bkt, "tenant"), fetcher,
-						storeDir, cfg.bucketStoreConfig, selectAllStrategy{}, newStaticChunksLimiterFactory(0), newStaticSeriesLimiterFactory(0),
+						storeDir, cfg.bucketStoreConfig, worstCaseFetchedDataStrategy{1}, newStaticChunksLimiterFactory(0), newStaticSeriesLimiterFactory(0),
 						newGapBasedPartitionersHelper(mimir_tsdb.DefaultPartitionerMaxGapSize), hashcache.NewSeriesHashCache(1024*1024), NewBucketStoreMetrics(nil), WithLogger(logger),
 					)
 					require.NoError(t, err)
@@ -101,6 +106,15 @@ func TestBucketStore_IndexV4(t *testing.T) {
 						require.NoError(t, services.StopAndAwaitTerminated(context.Background(), store))
 					})
 					require.NoError(t, store.InitialSync(ctx))
+					// A selective label-values query must not enumerate the target page before resolving its matcher.
+					trackedBucket.pageReads.Store(0)
+					lastValue := expected[len(expected)-1].Labels[1].Value
+					selectedValues, err := store.LabelValues(ctx, &storepb.LabelValuesRequest{Start: math.MinInt64, End: math.MaxInt64, Label: "i", Matchers: []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: lastValue}}})
+					require.NoError(t, err)
+					require.Equal(t, []string{lastValue}, selectedValues.Values)
+					if tc.headerVersion == indexheader.BinaryFormatV2 {
+						require.Equal(t, int64(1), trackedBucket.pageReads.Load())
+					}
 					srv := newStoreGatewayTestServer(t, store)
 					for _, tc := range []struct {
 						name     string
@@ -109,6 +123,11 @@ func TestBucketStore_IndexV4(t *testing.T) {
 					}{
 						{"all", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "foo", Value: "bar"}}, expected},
 						{"last page", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: expected[len(expected)-1].Labels[1].Value}}, expected[len(expected)-1:]},
+						{"deferred regex", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: expected[len(expected)-1].Labels[1].Value}, {Type: storepb.LabelMatcher_RE, Name: "i", Value: ".+"}}, expected[len(expected)-1:]},
+						{"deferred rejecting regex", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: expected[len(expected)-1].Labels[1].Value}, {Type: storepb.LabelMatcher_RE, Name: "i", Value: ".*absent.*"}}, nil},
+						{"deferred negative regex", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: expected[len(expected)-1].Labels[1].Value}, {Type: storepb.LabelMatcher_NRE, Name: "i", Value: ".+"}}, nil},
+						{"missing label matches empty", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: expected[len(expected)-1].Labels[1].Value}, {Type: storepb.LabelMatcher_EQ, Name: "missing", Value: ""}}, expected[len(expected)-1:]},
+						{"missing label rejects empty", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: expected[len(expected)-1].Labels[1].Value}, {Type: storepb.LabelMatcher_NEQ, Name: "missing", Value: ""}}, nil},
 						{"absent", []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "i", Value: "absent"}}, nil},
 					} {
 						t.Run(tc.name, func(t *testing.T) {
@@ -161,7 +180,9 @@ func TestBucketStore_IndexV4(t *testing.T) {
 // v4SparseReadTrackingBucket records sparse-sidecar reads, including attempts for missing objects.
 type v4SparseReadTrackingBucket struct {
 	objstore.Bucket
-	sparseReads atomic.Int64
+	sparseReads        atomic.Int64
+	pageReads          atomic.Int64
+	pageStart, pageEnd int64
 }
 
 func (b *v4SparseReadTrackingBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
@@ -175,5 +196,13 @@ func (b *v4SparseReadTrackingBucket) GetRange(ctx context.Context, name string, 
 	if filepath.Base(name) == block.SparseIndexHeaderFilename {
 		b.sparseReads.Add(1)
 	}
+	if filepath.Base(name) == block.IndexFilename && offset >= b.pageStart && offset < b.pageEnd {
+		b.pageReads.Add(1)
+	}
 	return b.Bucket.GetRange(ctx, name, offset, length)
 }
+
+type v4IndexBytes []byte
+
+func (b v4IndexBytes) Len() int                    { return len(b) }
+func (b v4IndexBytes) Range(start, end int) []byte { return b[start:end] }

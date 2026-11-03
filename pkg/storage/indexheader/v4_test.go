@@ -147,6 +147,24 @@ func TestV4IndexHeaderRejectsCorruption(t *testing.T) {
 			binary.BigEndian.PutUint64(b[toc.PostingsTable+8:], ^uint64(0))
 			binary.BigEndian.PutUint32(b[toc.PostingsTable+24:], crc32.Checksum(b[toc.PostingsTable:toc.PostingsTable+24], castagnoliTable))
 		}, true},
+		{"old-directory-format", func(b []byte) {
+			copy(b[toc.PostingsTable:], "PPOT0001")
+			binary.BigEndian.PutUint32(b[toc.PostingsTable+24:], crc32.Checksum(b[toc.PostingsTable:toc.PostingsTable+24], castagnoliTable))
+		}, true},
+		{"directory-postings-bound", func(b []byte) {
+			size := binary.BigEndian.Uint64(b[toc.PostingsTable+16:])
+			d := encoding.Decbuf{B: b[directory : directory+size-4]}
+			_ = d.Be32()
+			_ = d.UvarintStr()
+			_ = d.UvarintStr()
+			_ = d.Be32()
+			_ = d.Be64()
+			_ = d.Be32()
+			_ = d.Be32()
+			at := directory + size - 4 - uint64(d.Len())
+			binary.BigEndian.PutUint64(b[at:], toc.PostingsTable)
+			binary.BigEndian.PutUint32(b[directory+size-4:], crc32.Checksum(b[directory:directory+size-4], castagnoliTable))
+		}, true},
 		{"page-checksum", func(b []byte) { b[toc.PostingsTable+28] ^= 1 }, false},
 	}
 	for _, tt := range tests {
@@ -162,10 +180,12 @@ func TestV4IndexHeaderRejectsCorruption(t *testing.T) {
 					switch tt.name {
 					case "symbol-directory-checksum":
 						require.ErrorIs(t, err, streamencoding.ErrInvalidChecksum)
-					case "header-checksum":
+					case "header-checksum", "old-directory-format":
 						require.ErrorContains(t, err, "invalid paged postings header")
 					case "directory-checksum":
 						require.ErrorIs(t, err, encoding.ErrInvalidChecksum)
+					case "directory-postings-bound":
+						require.ErrorContains(t, err, "invalid postings page bounds")
 					case "directory-bounds":
 						require.ErrorIs(t, err, encoding.ErrInvalidSize)
 					}
